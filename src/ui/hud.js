@@ -4,6 +4,7 @@ import { TIMES, systemTimeOfDay } from '../world/sky.js'
 import { STATUS_LABEL } from '../game/colony.js'
 import { FACE, FRAME_COLS, FRAME_ROWS } from '../agents/faces.js'
 import { PLOT_PALETTE, hashString } from '../world/plots.js'
+import { describeNeighbor } from '../game/neighbors.js'
 
 /**
  * The whole HUD, in plain DOM.
@@ -107,6 +108,10 @@ export class Hud {
     const body = this.$('.settings .body')
     const s = this.settings
     this.controls = []
+
+    // Neighbors first: it is the one group here that is about other people, and the one a
+    // first-time sharer is looking for.
+    body.appendChild(this._buildNeighbors())
 
     // Quality presets.
     body.appendChild(
@@ -321,6 +326,53 @@ export class Hud {
       this._slider('Effects', 'effectsVolume', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`, 'Hammering, drones, splashes, the chime when somebody needs you.')
     )
     body.appendChild(sound)
+  }
+
+  /** Settings → Neighbors: share yours, add theirs. Filled in by `setNeighbors`. */
+  _buildNeighbors() {
+    const g = group('Neighbors')
+    g.insertAdjacentHTML(
+      'beforeend',
+      `<div class="row">
+         <div class="label"><span>Share my colony</span><span class="hint">Friends on this Wi-Fi with your link see your repo names and what your bots are doing — never a title, a prompt or a path.</span></div>
+         <button type="button" class="toggle" role="switch" aria-label="Share my colony" data-nb="share"></button>
+       </div>
+       <div class="nb-sharing" data-nb="sharing" hidden>
+         <div class="row">
+           <div class="label"><span>Your name</span><span class="hint">On your ship's sign, on their map.</span></div>
+           <input class="text-input" data-nb="name" maxlength="40" spellcheck="false" />
+         </div>
+         <div class="nb-link"><code data-nb="link"></code></div>
+         <div class="pair">
+           <button type="button" class="btn" data-nb="copy">${ICON.copy} Copy link</button>
+           <button type="button" class="btn ghost" data-nb="rotate" title="Make a new link — the old one stops working at once">New link</button>
+         </div>
+         <div class="nb-note" data-nb="note"></div>
+       </div>
+       <div class="nb-add">
+         <input class="text-input" data-nb="paste" placeholder="Paste a friend's link" spellcheck="false" />
+         <button type="button" class="btn" data-nb="add">Add</button>
+       </div>
+       <div class="nb-list" data-nb="list"></div>`
+    )
+    const el = (name) => g.querySelector(`[data-nb="${name}"]`)
+    this.nb = {
+      share: el('share'), sharing: el('sharing'), name: el('name'), link: el('link'), copy: el('copy'),
+      rotate: el('rotate'), note: el('note'), paste: el('paste'), add: el('add'), list: el('list'),
+    }
+    const nb = this.nb
+    nb.share.addEventListener('click', () => this.actions.toggleSharing?.())
+    nb.name.addEventListener('change', () => this.actions.setShareName?.(nb.name.value))
+    nb.copy.addEventListener('click', () => this.actions.copyShareLink?.())
+    nb.rotate.addEventListener('click', () => this.actions.rotateShareKey?.())
+    const add = async () => {
+      if (await this.actions.addNeighbor?.(nb.paste.value)) nb.paste.value = ''
+    }
+    nb.add.addEventListener('click', add)
+    nb.paste.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') add()
+    })
+    return g
   }
 
   _row(label, hint) {
@@ -580,6 +632,67 @@ export class Hud {
     this._syncHiddenList()
   }
 
+  /**
+   * Settings → Neighbors and the sidebar's Neighbors list, from one model. Redrawn only when
+   * something on it changed — including the minute, because "last seen 4m ago" is on it.
+   */
+  setNeighbors(model) {
+    if (!this.nb || !model) return
+    const { sharing, neighbors, full } = model
+    const now = Date.now()
+    const signature = JSON.stringify([sharing, full, neighbors.map((n) => [n.id, n.name, n.status, describeNeighbor(n.status, n.lastSeenAt, now)])])
+    if (this._last.neighbors === signature) return
+    this._last.neighbors = signature
+
+    const nb = this.nb
+    nb.share.setAttribute('aria-checked', String(sharing.enabled))
+    nb.sharing.hidden = !sharing.enabled
+    if (document.activeElement !== nb.name) nb.name.value = sharing.name
+    nb.link.textContent = sharing.link || (sharing.error ? '—' : 'Opening the share port…')
+    nb.copy.disabled = !sharing.link
+    nb.note.textContent =
+      sharing.error || (IS_WIN ? 'If friends cannot see you, allow Node through Windows Firewall on private networks.' : '')
+    nb.note.classList.toggle('err', Boolean(sharing.error))
+    nb.add.disabled = full
+    nb.paste.disabled = full
+    nb.paste.placeholder = full ? 'Six neighbors — remove one to add another' : "Paste a friend's link"
+
+    nb.list.innerHTML = ''
+    for (const n of neighbors) {
+      const row = document.createElement('div')
+      row.className = 'nb-row'
+      row.innerHTML =
+        `<i class="nb-dot ${n.status}"></i>` +
+        `<span class="n">${escapeHtml(n.name)}</span>` +
+        `<span class="s">${escapeHtml(describeNeighbor(n.status, n.lastSeenAt, now))}</span>`
+      const remove = document.createElement('button')
+      remove.type = 'button'
+      remove.className = 'btn ghost'
+      remove.textContent = 'Remove'
+      remove.title = `Stop showing ${n.name}'s colony`
+      remove.addEventListener('click', () => this.actions.removeNeighbor?.(n.id))
+      row.appendChild(remove)
+      nb.list.appendChild(row)
+    }
+
+    const block = this.$('.neighbors-block')
+    block.hidden = neighbors.length === 0
+    const side = this.$('.neighbors')
+    side.innerHTML = ''
+    for (const n of neighbors) {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = 'repo'
+      b.title = `Fly to ${n.name}'s colony`
+      b.innerHTML =
+        `<i class="nb-dot ${n.status}"></i>` +
+        `<span class="n">${escapeHtml(n.name)}</span>` +
+        `<span class="count">${escapeHtml(describeNeighbor(n.status, n.lastSeenAt, now))}</span>`
+      b.addEventListener('click', () => this.actions.focusNeighbor?.(n.id))
+      side.appendChild(b)
+    }
+  }
+
   toggleHiddenList() {
     this.hiddenOpen = !this.hiddenOpen
     this._syncHiddenList()
@@ -697,8 +810,14 @@ export class Hud {
     // On a phone the card docks above the sheet's peek, so the sheet drops to make room.
     if (this.isPhone()) this.toggleSheet(false)
 
-    this.$('.thread-pop .title').textContent = thread.title || 'Untitled thread'
-    const status = STATUS_LABEL[agent.status] || agent.status
+    // A friend's bot says whose it is and what it is up to, and offers nothing to press.
+    const neighbor = thread.neighbor || null
+    card.classList.toggle('readonly', Boolean(neighbor))
+    this.$('.thread-pop .title').textContent = neighbor
+      ? `${neighbor.name} · ${thread.project}`
+      : thread.title || 'Untitled thread'
+    const status =
+      neighbor && agent.status === 'waiting' ? `Waiting on ${neighbor.name}` : STATUS_LABEL[agent.status] || agent.status
     const meta = this.$('.thread-pop .meta')
     const bits = [
       `<span class="tag"><i class="swatch" style="background:${hex(agent.trim.getHex())}"></i>${escapeHtml(status)}</span>`,
@@ -709,7 +828,8 @@ export class Hud {
     if (thread.worktree) bits.push(`<span class="tag">⑂ ${escapeHtml(thread.worktree)}</span>`)
     if (thread.gitBranch) bits.push(`<span class="tag">${escapeHtml(thread.gitBranch)}</span>`)
     if (thread.model) bits.push(`<span class="tag">${escapeHtml(shortModel(thread.model))}</span>`)
-    bits.push(`<span>${ago(thread.lastActivityAt)}</span>`)
+    // An away friend's bots are hydrated as last active at the epoch, which is not "never".
+    bits.push(`<span>${neighbor && !thread.lastActivityAt ? 'away' : ago(thread.lastActivityAt)}</span>`)
     meta.innerHTML = bits.join('')
 
     const pct = Math.round((this.actions.progressFor?.(thread.id) ?? 0) * 100)
@@ -1084,6 +1204,10 @@ const TEMPLATE = `
           <span class="label">0 hidden</span>
         </button>
         <div class="hidden-projects" hidden></div>
+      </div>
+      <div class="neighbors-block" hidden>
+        <div class="sec-head"><span>Neighbors</span></div>
+        <div class="neighbors"></div>
       </div>
     </div>
 

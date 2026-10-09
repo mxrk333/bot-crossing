@@ -13,6 +13,9 @@ import {
   openThread as harnessOpenThread,
   scanThreads,
 } from './scan.mjs'
+import { createShareService, pickLanAddress } from './share.mjs'
+import { buildSnapshot } from './share-snapshot.mjs'
+import { createNeighborFetcher } from './neighbors.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = process.env.BOT_CROSSING_DATA || path.join(here, '..', 'data')
@@ -59,11 +62,39 @@ const emptyState = () => ({
   hiddenProjects: [],
   viewedAt: {},
   settings: null,
+  sharing: { enabled: false, key: '', name: '' },
+  neighbors: [],
   updatedAt: 0,
 })
 
 const asObject = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {})
 const asArray = (v) => (Array.isArray(v) ? v : [])
+
+const KEY_HEX = /^[0-9a-f]{32}$/
+
+/** Sharing is off unless the file says otherwise, and a key that is not 32 hex chars is no key. */
+function asSharing(v) {
+  const o = asObject(v)
+  return {
+    enabled: o.enabled === true,
+    key: typeof o.key === 'string' && KEY_HEX.test(o.key) ? o.key : '',
+    name: typeof o.name === 'string' ? o.name.slice(0, 40) : '',
+  }
+}
+
+/** At most six friends, each with somewhere to fetch from and a slot to stand in. */
+function asNeighbors(v) {
+  return asArray(v)
+    .filter((n) => n && typeof n === 'object' && typeof n.id === 'string' && n.id && typeof n.url === 'string')
+    .map((n) => ({
+      id: n.id,
+      url: n.url,
+      key: typeof n.key === 'string' ? n.key : '',
+      slot: Number.isInteger(n.slot) ? n.slot : 0,
+      addedAt: Number(n.addedAt) || 0,
+    }))
+    .slice(0, 6)
+}
 
 async function readState() {
   try {
@@ -78,6 +109,8 @@ async function readState() {
       hiddenProjects: asArray(raw.hiddenProjects).map(String).filter(Boolean),
       viewedAt: asObject(raw.viewedAt),
       settings: raw.settings && typeof raw.settings === 'object' ? raw.settings : null,
+      sharing: asSharing(raw.sharing),
+      neighbors: asNeighbors(raw.neighbors),
       updatedAt: Number(raw.updatedAt) || 0,
     }
   } catch {
@@ -113,6 +146,8 @@ async function writeState(next) {
     hiddenProjects: asArray(next.hiddenProjects).map(String).filter(Boolean),
     viewedAt: asObject(next.viewedAt),
     settings: next.settings && typeof next.settings === 'object' ? next.settings : null,
+    sharing: asSharing(next.sharing),
+    neighbors: asNeighbors(next.neighbors),
     updatedAt: Date.now(),
   }
   await fsp.mkdir(DATA_DIR, { recursive: true })
@@ -126,6 +161,58 @@ async function writeState(next) {
   }
   return state
 }
+
+// ── sharing ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Where friends reach this colony. Read once, at import, like DATA_DIR. `0` is a real value —
+ * "any free port" — which is what the tests use, so it cannot be treated as unset.
+ */
+const SHARE_HOST = process.env.BOT_CROSSING_SHARE_HOST || '0.0.0.0'
+const SHARE_PORT_RAW = process.env.BOT_CROSSING_SHARE_PORT
+const SHARE_PORT = SHARE_PORT_RAW === undefined || SHARE_PORT_RAW === '' ? 5275 : Number(SHARE_PORT_RAW)
+
+/** What friends see on the sign if the sharer never typed a name. */
+function defaultName() {
+  try {
+    return os.userInfo().username || 'Neighbor'
+  } catch {
+    return 'Neighbor'
+  }
+}
+
+/** The address a friend on the same Wi-Fi would type. The browser has no way to learn it. */
+function lanAddress() {
+  return pickLanAddress(os.networkInterfaces())
+}
+
+const sharing = createShareService({
+  host: SHARE_HOST,
+  port: SHARE_PORT,
+  getKey: async () => {
+    const s = (await readState()).sharing
+    return s.enabled ? s.key : ''
+  },
+  snapshot: async () =>
+    buildSnapshot({
+      threads: await reconcileArchived(await scanThreads()),
+      state: await readState(),
+      name: defaultName(),
+    }),
+})
+
+/** Open or close the share port to match the colony file. Called at boot and after every save. */
+export async function syncSharing() {
+  const s = (await readState()).sharing
+  await sharing.sync(Boolean(s.enabled && s.key))
+}
+
+export function stopSharing() {
+  return sharing.close()
+}
+
+/** Friends' last good snapshots live here for as long as this server does — never on disk. */
+const neighborFetcher = createNeighborFetcher()
 
 /**
 /**
@@ -433,8 +520,21 @@ export async function apiMiddleware(req, res, next) {
       return serialise(async () => {
         const current = await readState()
         if (base && current.updatedAt !== base) return send(res, 409, current)
-        return send(res, 200, await writeState(body))
+        const saved = await writeState(body)
+        // The page reads /api/sharing straight after a save that flipped the toggle, so the port
+        // has to have opened (or failed to) before this answers.
+        await syncSharing().catch(() => {})
+        return send(res, 200, saved)
       })
+    }
+
+    if (url.pathname === '/api/sharing' && req.method === 'GET') {
+      return send(res, 200, { ...sharing.status(), lanAddress: lanAddress(), defaultName: defaultName() })
+    }
+
+    if (url.pathname === '/api/neighbors' && req.method === 'GET') {
+      const { neighbors } = await readState()
+      return send(res, 200, { neighbors: await neighborFetcher.refresh(neighbors) })
     }
 
     if (url.pathname === '/api/open' && req.method === 'POST') {

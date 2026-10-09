@@ -17,6 +17,8 @@ import { shorelinePoints } from './world/planet.js'
 import { shipPosition } from './world/plots.js'
 import {
   fetchThreads,
+  fetchNeighbors,
+  fetchSharing,
   fetchState,
   saveState,
   openThread,
@@ -26,6 +28,7 @@ import {
 import { hideProject, hiddenCatalog, unhideProject } from './game/hidden-projects.js'
 import { withErrands } from './game/errands.js'
 import { canGrab } from './agents/carry.js'
+import { NEIGHBOR_CAP, addNeighbor, hydrateNeighbors, newShareKey, removeNeighbor, shareLink } from './game/neighbors.js'
 
 /**
  * Boot and the outer game loop.
@@ -62,7 +65,7 @@ engine.setPlanetGrade(PLANETS[settings.get('planet')]?.grade)
 const rig = new CameraRig(engine.camera, engine.canvas, settings)
 const colony = new Colony(engine.scene, settings, engine.camera, engine.renderer)
 
-let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, hiddenProjects: [], viewedAt: {} }
+let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, hiddenProjects: [], viewedAt: {}, sharing: { enabled: false, key: '', name: '' }, neighbors: [] }
 let threads = []
 /** Last legend built for the bottom bar, kept so the open zone's chip can light up between polls. */
 let legendProjects = []
@@ -75,6 +78,10 @@ let hoverId = null
 let statusCursor = 0
 let pendingSave = 0
 const hoverGround = new THREE.Vector3()
+/** What our server last fetched from each friend — `GET /api/neighbors`. */
+let neighborResults = []
+/** Whether our own share port is open, and on what address — `GET /api/sharing`. */
+let sharingInfo = null
 
 // ── actions the HUD can trigger ────────────────────────────────────────────────────────
 
@@ -128,7 +135,7 @@ const actions = {
   /** Fly to the next astronaut in a given state, cycling through them on repeat presses. */
   focusStatus: (status) => {
     const key = status === 'agents' ? null : status
-    const pool = colony.astronauts.agents.filter((a) => (key ? a.status === key : true))
+    const pool = colony.astronauts.agents.filter((a) => !a.neighbor && (key ? a.status === key : true))
     if (!pool.length) {
       hud.hint(key ? `Nobody is ${(STATUS_LABEL[key] || key).toLowerCase()} right now` : 'No bots on the surface')
       return
@@ -292,8 +299,95 @@ const actions = {
   // The card's bar is about the *thread*, not about how much of its building has risen —
   // those were the same number while construction was drawn by burying the structure.
   progressFor: (id) => {
-    const thread = threads.find((t) => t.id === id)
+    const thread = threads.find((t) => t.id === id) || colony.neighborThreads.get(id)
     return thread ? transcriptProgress(thread) : 0
+  },
+
+  // ── neighbors ──────────────────────────────────────────────────────────────────────
+
+  /** On makes a key if there is none; off keeps it, so turning back on reuses the same link. */
+  toggleSharing: async () => {
+    const previous = state.sharing
+    const current = previous || { enabled: false, key: '', name: '' }
+    const enabled = !current.enabled
+    state.sharing = {
+      enabled,
+      key: enabled && !/^[0-9a-f]{32}$/.test(current.key || '') ? newShareKey() : current.key || '',
+      name: current.name || sharingInfo?.defaultName || '',
+    }
+    // The port follows the file, so a switch that did not save did not happen.
+    if (!(await saveNow())) {
+      state.sharing = previous
+      return
+    }
+    await refreshSharing()
+  },
+
+  setShareName: (name) => {
+    state.sharing = { ...(state.sharing || {}), name: String(name || '').trim().slice(0, 40) }
+    queueSave()
+    hud.setNeighbors(neighborModel())
+  },
+
+  rotateShareKey: async () => {
+    if (!state.sharing?.enabled) return
+    const previous = state.sharing
+    state.sharing = { ...state.sharing, key: newShareKey() }
+    // Unsaved, the old key is still the one being served; showing the new link would be a lie.
+    if (!(await saveNow())) {
+      state.sharing = previous
+      return
+    }
+    await refreshSharing()
+    hud.toast('New link made — the old one no longer works')
+  },
+
+  copyShareLink: async () => {
+    const link = neighborModel().sharing.link
+    if (!link) return
+    try {
+      await navigator.clipboard.writeText(link)
+      hud.toast('Link copied')
+    } catch {
+      const copied = copyFallback(link)
+      hud.toast(copied ? 'Link copied' : 'Could not reach the clipboard', copied ? '' : 'err')
+    }
+  },
+
+  addNeighbor: async (text) => {
+    const { list, error, updated } = addNeighbor(state.neighbors || [], text)
+    if (error) {
+      hud.toast(error, 'err')
+      return false
+    }
+    const previous = state.neighbors
+    state.neighbors = list
+    // The server fetches friends from the file, so one that did not save would never be reached.
+    if (!(await saveNow())) {
+      state.neighbors = previous
+      return false
+    }
+    await poll() // reach them now rather than on the next tick
+    hud.toast(updated ? 'Link updated' : 'Neighbor added — they appear once their machine answers')
+    return true
+  },
+
+  removeNeighbor: async (id) => {
+    state.neighbors = removeNeighbor(state.neighbors || [], id)
+    neighborResults = neighborResults.filter((r) => r.id !== id)
+    await saveNow()
+    applyThreads(threads)
+    hud.setNeighbors(neighborModel())
+  },
+
+  focusNeighbor: (id) => {
+    const site = colony.neighborSites.find((s) => s.id === id)
+    if (!site) {
+      hud.hint('Not reached yet — nothing to fly to')
+      return
+    }
+    if (rig.following) select(null, {})
+    rig.focus(new THREE.Vector3(site.x, 0, site.z), { distance: Math.max(30, site.r * 2.2) })
   },
 }
 
@@ -336,7 +430,7 @@ function select(id, { fly = false } = {}) {
     ambience.play(`select-${n}`, { x: agent.pos.x, y: agent.pos.y + 0.8, z: agent.pos.z, gain: 0.9 })
   }
   // Picking somebody is also picking the zone they are standing on: the sidebar follows.
-  if (thread?.project && colony.plots.has(thread.project)) selectedProject = thread.project
+  if (!thread?.neighbor && thread?.project && colony.plots.has(thread.project)) selectedProject = thread.project
   syncProject()
   if (fly) {
     rig.focus(new THREE.Vector3(agent.pos.x, 0, agent.pos.z), { distance: Math.min(rig.desiredDistance, 26) })
@@ -765,11 +859,11 @@ engine.canvas.addEventListener('pointerdown', (e) => {
   const agent = colony.pick(p.x, p.y, p.aspect)
   if (agent) {
     // Held, it picks up; let go early and it was a selection all along.
-    if (!canGrab(agent)) return
+    if (!canGrab(agent) || agent.neighbor) return
     drag.candidateAgent = agent
   } else {
     const plot = plotUnder(e, p)
-    if (!plot) return
+    if (!plot || plot.neighbor) return
     drag.candidate = plot.name
   }
   drag.startX = e.clientX
@@ -832,7 +926,12 @@ engine.canvas.addEventListener('pointerup', (e) => {
   // opens that repo's sidebar, and bare ground closes that too.
   if (selectedId) select(null, {})
   const plot = plotUnder(e, p)
-  if (plot) selectProject(plot.name, {})
+  if (plot?.neighbor) {
+    // A friend's zone has no folder here and nothing to do to it — say whose it is and stop.
+    let bots = 0
+    for (const t of colony.neighborThreads.values()) if (t.neighbor.id === plot.neighbor.id && t.project === plot.name) bots++
+    hud.hint(`${plot.neighbor.name} · ${plot.name} · ${bots} bot${bots === 1 ? '' : 's'}`)
+  } else if (plot) selectProject(plot.name, {})
   else actions.closeProject()
 })
 
@@ -992,7 +1091,8 @@ function applyThreads(list) {
   }
   if (firstSeen) queueSave()
 
-  const stats = colony.setThreads(list, archivedSet, hiddenSet, known)
+  const stats = colony.setThreads(list, archivedSet, hiddenSet, known, hydrateNeighbors(state.neighbors, neighborResults))
+  rig.setWorldLimit(colony.worldReach())
   hud.setStats(stats)
   chimeForNewWaiting(list, archivedSet, hiddenSet)
 
@@ -1058,14 +1158,72 @@ async function poll() {
   if (polling) return
   polling = true
   try {
-    const res = await fetchThreads()
+    // Friends ride the same clock as your own threads. A failed neighbour fetch keeps what we
+    // had: their settlement going quiet is the server's call, made per friend.
+    const wantNeighbors = (state.neighbors || []).length > 0
+    const [res, nb] = await Promise.all([
+      fetchThreads(),
+      wantNeighbors ? fetchNeighbors().catch(() => null) : Promise.resolve({ neighbors: [] }),
+    ])
+    if (nb) neighborResults = nb.neighbors || []
     applyThreads(res.threads || [])
+    hud.setNeighbors(neighborModel())
     hud.removeBoot()
   } catch (err) {
     hud.toast(err.message || 'Could not reach the thread scanner', 'err')
     hud.removeBoot()
   } finally {
     polling = false
+  }
+}
+
+/**
+ * Save now rather than in half a second: the share port follows the file, and the page asks about
+ * it next. False when the save failed, so a caller can put its change back rather than carry on.
+ */
+async function saveNow() {
+  clearTimeout(pendingSave)
+  try {
+    state = await saveState(state)
+    return true
+  } catch (err) {
+    hud.toast(err.message || 'Could not save the colony', 'err')
+    return false
+  }
+}
+
+/** Ask our own server whether the share port is open, then redraw the panel. */
+async function refreshSharing() {
+  sharingInfo = await fetchSharing().catch(() => null)
+  hud.setNeighbors(neighborModel())
+}
+
+const hostOf = (url) => {
+  try {
+    return new URL(url).hostname
+  } catch {
+    return 'Neighbor'
+  }
+}
+
+/** Everything Settings → Neighbors and the sidebar list show, from state plus the last fetch. */
+function neighborModel() {
+  const sharing = state.sharing || {}
+  const info = sharingInfo
+  const byId = new Map(neighborResults.map((r) => [r.id, r]))
+  const noAddress = sharing.enabled && info?.listening && !info.lanAddress
+  return {
+    sharing: {
+      enabled: Boolean(sharing.enabled),
+      name: sharing.name || info?.defaultName || '',
+      error: sharing.enabled ? info?.error || (noAddress ? 'No Wi-Fi address found on this machine' : '') : '',
+      link: sharing.enabled && info?.listening ? shareLink({ lanAddress: info.lanAddress, port: info.port, key: sharing.key }) : '',
+    },
+    neighbors: (state.neighbors || []).map((n) => {
+      const r = byId.get(n.id)
+      return { id: n.id, name: r?.snapshot?.name || hostOf(n.url), status: r?.status || 'unreachable', lastSeenAt: r?.lastSeenAt || 0 }
+    }),
+    full: (state.neighbors || []).length >= NEIGHBOR_CAP,
   }
 }
 
@@ -1116,6 +1274,8 @@ async function boot() {
   colony.astronauts.setRig(crewRig())
   if (!kitError) colony.onAssetsReady()
 
+  // The settings panel needs the share address before it can show a link.
+  refreshSharing()
   await poll()
   setInterval(poll, POLL_MS)
   window.addEventListener('focus', poll)
@@ -1150,6 +1310,9 @@ settings.onChange((changed, scope) => {
   // rebuilt from the list rather than merely re-rendered.
   if (changed.has('hideDormant')) applyThreads(threads)
   if (changed.has('maxAgents')) applyThreads(threads)
+  // Friends sit on different sides of each world (only landward on Shoreline), so they move now
+  // rather than on the next poll.
+  if (changed.has('planet')) applyThreads(threads)
 })
 
 // ── frame ─────────────────────────────────────────────────────────────────────────────
