@@ -33,6 +33,7 @@ import { Particles } from '../agents/particles.js'
 import { Navigation } from '../agents/navigation.js'
 import { liveThreadsForColony } from './hidden-projects.js'
 import { statusFor } from './status.js'
+import { WarDirector } from './war-director.js'
 
 export { statusFor }
 
@@ -184,6 +185,8 @@ export class Colony {
     this.onSound = null
     this.nav = new Navigation()
     this.astronauts.setNavigation(this.nav)
+    /** War mode's battle, if one is on: a show staged with the idle bots, on top of everything else. */
+    this.war = new WarDirector(this)
 
     this.plotGroup = new THREE.Group()
     this.labelGroup = new THREE.Group()
@@ -843,8 +846,9 @@ export class Colony {
         entry = { ship, label: null, text: '', q: off.q, r: off.r }
         this.neighborShips.set(n.id, entry)
       }
-      // The minutes live in Settings; the sign only says whether they are here.
-      const text = n.online ? n.name : `${n.name} · away`
+      // The minutes live in Settings; the sign only says whether they are here, and how your
+      // battles with them have gone (`record`, won–lost, set by the page once there is one).
+      const text = [n.name, n.online ? '' : 'away', n.record || ''].filter(Boolean).join(' · ')
       if (entry.text !== text) {
         if (entry.label) {
           this.labelGroup.remove(entry.label)
@@ -900,6 +904,24 @@ export class Colony {
     }
     for (const p of this._shipSpots()) r = Math.max(r, Math.hypot(p.x, p.z))
     return r + PLOT_CELL * 2
+  }
+
+  /** How far from the middle the home colony alone reaches: the edge a battle against it is fought just outside. */
+  homeReach() {
+    let r = 0
+    for (const plot of this.plotOrder) {
+      for (const l of plot.localCenters) r = Math.max(r, Math.hypot(plot.center.x + l.x, plot.center.z + l.z))
+    }
+    const ship = shipPosition()
+    return Math.max(r, Math.hypot(ship.x, ship.z)) + PLOT_CELL
+  }
+
+  /**
+   * War mode: the battle that is live, or null, and which side home is on — `{ side: 'attack' |
+   * 'defend', enemyNeighborId }`. Safe to call on every poll; the same battle again changes nothing.
+   */
+  setBattle(battle, { side, enemyNeighborId } = {}) {
+    this.war.setBattle(battle, { side, enemyNeighborId })
   }
 
   /**
@@ -1284,6 +1306,9 @@ export class Colony {
     for (const n of this.neighborShips.values()) n.ship.update(dt, elapsed, night)
 
     this._growBuildings(dt)
+    // Orders first, so a fighter acts on this frame's phase rather than the last one's. The battle
+    // runs on the wall clock: it is the one clock both screens share.
+    this.war.update(dt, Date.now())
     this.astronauts.update(dt, elapsed)
     this.astronauts.updateRings(elapsed)
     this.indicators.update(this.astronauts.agents, elapsed, (a) => this._badgeFor(a))
@@ -1513,6 +1538,7 @@ export class Colony {
 
   dispose() {
     for (const id of [...this.neighborShips.keys()]) this._removeNeighborShip(id)
+    this.war.dispose()
     this.reflections.dispose()
     this.sky.dispose()
     this.fauna.dispose()

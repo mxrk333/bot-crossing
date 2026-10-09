@@ -232,3 +232,49 @@ test('neighbors merge by id: an add in each tab survives, a removal stays remove
   const removed = mergeState({ neighbors: [a, b] }, { neighbors: [b] }, { neighbors: [a, b] })
   assert.deepEqual(removed.neighbors.map((n) => n.id), ['nb_b'])
 })
+
+// ── war ──────────────────────────────────────────────────────────────────────
+
+const WAR_BATTLE = { id: 'war_k_1', target: 'a'.repeat(16), seed: 9, startedAt: 1, attackers: 4, defenders: 5, targetNeighborId: 'nb_1' }
+
+test('war round-trips through the colony file', async () => {
+  await withServer(async ({ call, put }) => {
+    const war = { enabled: true, battle: WAR_BATTLE, tally: { nb_1: { won: 2, lost: 1 } }, seen: ['war_k_0'], busyUntil: 123456 }
+    assert.equal((await put({ war })).status, 200)
+    const state = await (await call('/api/state')).json()
+    assert.deepEqual(state.war, war)
+  })
+})
+
+test('a fresh colony is at peace', async () => {
+  await withServer(async ({ call }) => {
+    const state = await (await call('/api/state')).json()
+    assert.deepEqual(state.war, { enabled: false, battle: null, tally: {}, seen: [], busyUntil: 0 })
+  })
+})
+
+test('junk war entries are dropped and seen is capped at fifty', async () => {
+  await withServer(async ({ call, put }) => {
+    const seen = Array.from({ length: 60 }, (_, i) => `war_x_${i}`)
+    await put({ war: {
+      enabled: 'yes',
+      battle: { ...WAR_BATTLE, attackers: 0 },
+      tally: { nb_1: { won: 3, lost: 'x' }, nb_2: null, nb_3: { won: -1, lost: 2 } },
+      seen: [...seen, 5, null],
+      busyUntil: 'later',
+    } })
+    const { war } = await (await call('/api/state')).json()
+    assert.equal(war.enabled, false)
+    assert.equal(war.battle, null)
+    assert.deepEqual(war.tally, { nb_1: { won: 3, lost: 0 }, nb_3: { won: 0, lost: 2 } })
+    assert.deepEqual(war.seen, seen.slice(0, 50))
+    assert.equal(war.busyUntil, 0)
+  })
+})
+
+test('war merges whole: whichever tab changed it wins', () => {
+  const peace = { enabled: false, battle: null, tally: {}, seen: [], busyUntil: 0 }
+  const mine = { ...peace, enabled: true, busyUntil: 99 }
+  assert.deepEqual(mergeState({ war: peace }, { war: mine }, { war: peace }).war, mine)
+  assert.deepEqual(mergeState({ war: peace }, { war: peace }, { war: mine }).war, mine)
+})
